@@ -6,7 +6,6 @@
 #include <errno.h>
 #include <stdint.h>
 #include <assert.h>
-#include <linux/if_alg.h>
 #include <pthread.h>
 #include <time.h>
 #include <sys/times.h>
@@ -36,6 +35,23 @@
 int bytes_recv;
 int port;
 char* test_data;
+
+#define KTLS_SET_IV_RECV                1
+#define KTLS_SET_KEY_RECV               2
+#define KTLS_SET_SALT_RECV              3
+#define KTLS_SET_IV_SEND                4
+#define KTLS_SET_KEY_SEND               5
+#define KTLS_SET_SALT_SEND              6
+#define KTLS_SET_MTU                    7
+#define KTLS_UNATTACH                   8
+#define KTLS_VERSION_1_2                1
+#define AF_KTLS         12
+#define KTLS_CIPHER_AES_GCM_128         51
+struct sockaddr_ktls {
+        unsigned short   sa_cipher;
+        unsigned short   sa_socket;
+        unsigned short   sa_version;
+};
 
 /* Opaque OpenSSL structures to fetch keys */
 #define u64 uint64_t
@@ -229,33 +245,21 @@ int main_tls_client() {
   printf("Received openssl test data: %i %i\n", res, total_recv);
 
 /* Kernel TLS tests */
-  int tfmfd = socket(AF_ALG, SOCK_SEQPACKET, 0);
+  int tfmfd = socket(AF_KTLS, SOCK_STREAM, 0);
   if (tfmfd == -1) {
     perror("socket error:");
     exit(-1);
   }
 
-  struct sockaddr_alg sa = {
-    .salg_family = AF_ALG,
-    .salg_type = "tls", /* this selects the hash logic in the kernel */
-    .salg_name = "rfc5288(gcm(aes))" /* this is the cipher name */
+  struct sockaddr_ktls sa = {
+                .sa_cipher = KTLS_CIPHER_AES_GCM_128,
+                .sa_socket = server,
+                .sa_version = KTLS_VERSION_1_2,
   };
 
   if (bind(tfmfd, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
     perror("AF_ALG: bind failed");
     close(tfmfd);
-    exit(-1);
-  }
-
-  int opfd = accept(tfmfd, NULL, 0);
-  if (opfd == -1) {
-    perror("accept:");
-    close(tfmfd);
-    exit(-1);
-  }
-
-  if (setsockopt(tfmfd, SOL_ALG, ALG_SET_AEAD_AUTHSIZE, NULL, 16)) {
-    perror("AF_ALG: set authsize failed\n");
     exit(-1);
   }
 
@@ -271,116 +275,54 @@ int main_tls_client() {
   unsigned char* writeIV = gcmWrite->iv;
   unsigned char* readIV = gcmRead->iv;
 
-  char keyiv[20];
+  char keyiv[20] = {0};
   memcpy(keyiv, writeKey, 16);
-  memcpy(keyiv + 16, writeIV, 4);
-
-  if (setsockopt(tfmfd, SOL_ALG, ALG_SET_KEY, keyiv, 20)) {
+  if (setsockopt(tfmfd, AF_KTLS, KTLS_SET_KEY_SEND, keyiv, 16)) {
     perror("AF_ALG: set write key failed\n");
     exit(-1);
   }
-
-  memcpy(keyiv, readKey, 16);
-  memcpy(keyiv + 16, readIV, 4);
-
-  if (setsockopt(tfmfd, SOL_ALG, ALG_SET_KEY, keyiv, 20)) {
-    perror("AF_ALG: set read key failed\n");
+  memcpy(keyiv, writeIV, 4);
+  if (setsockopt(tfmfd, AF_KTLS, KTLS_SET_SALT_SEND, keyiv, 4)) {
+    perror("AF_ALG: set write iv failed\n");
     exit(-1);
   }
 
-  // Load up the cmsg data
-  struct cmsghdr *header = NULL;
-  uint32_t *type = NULL;
-  struct msghdr msg;
-
-  /* IV data */
-  struct af_alg_iv *alg_iv = NULL;
-  int ivsize = 12;
-  uint32_t iv_msg_size = CMSG_SPACE(sizeof(*alg_iv) + ivsize);
-
-  /* AEAD data */
-  uint32_t *assoclen = NULL;
-  uint32_t assoc_msg_size = CMSG_SPACE(sizeof(*assoclen));
-
-  uint32_t bufferlen =
-    CMSG_SPACE(sizeof(*type)) + /* Encryption / Decryption */
-    iv_msg_size +/* IV */
-    assoc_msg_size;/* AEAD associated data size */
-
-  memset(&msg, 0, sizeof(msg));
-
-  char* buffer = calloc(1, bufferlen);
-  if (!buffer)
-    return -ENOMEM;
-
-  msg.msg_control = buffer;
-  msg.msg_controllen = bufferlen;
-  msg.msg_iov = NULL;
-  msg.msg_iovlen = 0;
-
-  /* encrypt/decrypt operation */
-  header = CMSG_FIRSTHDR(&msg);
-  header->cmsg_level = SOL_ALG;
-  header->cmsg_type = ALG_SET_OP;
-  header->cmsg_len = CMSG_LEN(sizeof(*type));
-  type = (void*)CMSG_DATA(header);
-  *type = server;
-
-
-  /* set IV */
-  header = CMSG_NXTHDR(&msg, header);
-  header->cmsg_level = SOL_ALG;
-  header->cmsg_type = ALG_SET_IV;
-  header->cmsg_len = iv_msg_size;
-  alg_iv = (void*)CMSG_DATA(header);
-  alg_iv->ivlen = 8;
   uint64_t writeSeq;
   unsigned char* writeSeqNum = ssl->s3->write_sequence;
   memcpy(&writeSeq, writeSeqNum, sizeof(writeSeq));
-
-  memcpy(alg_iv->iv, &writeSeq, 8);
-
-
-  /* set AEAD information */
-  /* Set associated data length */
-  header = CMSG_NXTHDR(&msg, header);
-  header->cmsg_level = SOL_ALG;
-  header->cmsg_type = ALG_SET_AEAD_ASSOCLEN;
-  header->cmsg_len = CMSG_LEN(sizeof(*assoclen));
-  assoclen = (void*)CMSG_DATA(header);
-  *assoclen = 13 + 8;
-
-  ret = sendmsg(opfd, &msg, MSG_MORE);
-  if (ret < 0) {
-    perror("sendmsg");
+  if (setsockopt(tfmfd, AF_KTLS, KTLS_SET_IV_SEND, (unsigned char*)&writeSeq, 8)) {
+    perror("AF_ALG: set write salt failed\n");
     exit(-1);
   }
 
-  header = CMSG_FIRSTHDR(&msg);
-  header = CMSG_NXTHDR(&msg, header);
-  alg_iv = (void*)CMSG_DATA(header);
+
+  memcpy(keyiv, readKey, 16);
+  if (setsockopt(tfmfd, AF_KTLS, KTLS_SET_KEY_RECV, keyiv, 16)) {
+    perror("AF_ALG: set read key failed\n");
+    exit(-1);
+  }
+  memcpy(keyiv, readIV, 4);
+  if (setsockopt(tfmfd, AF_KTLS, KTLS_SET_SALT_RECV, keyiv, 4)) {
+    perror("AF_ALG: set read iv failed\n");
+    exit(-1);
+  }
+
   uint64_t readSeq;
   unsigned char* readSeqNum = ssl->s3->read_sequence;
   memcpy(&readSeq, readSeqNum, sizeof(readSeq));
-  memcpy(alg_iv->iv, &readSeq, 8);
-
-  ret = sendmsg(opfd, &msg, MSG_MORE);
-  if (ret < 0) {
-    perror("sendmsg recv");
+  if (setsockopt(tfmfd, AF_KTLS, KTLS_SET_IV_RECV, (unsigned char*)&readSeq, 8)) {
+    perror("AF_ALG: set read salt failed\n");
     exit(-1);
   }
 
-  // Try some simple writes
-
-  send(opfd, buf, 10, 0);
-  send(opfd, buf, 100, 0);
-  send(opfd, buf, 16000, 0);
+  send(tfmfd, "abcdefghij", 10, 0);
   printf("Successful send\n");
 
   res = 0;
   total_recv = 0;
 
-  res = recv(opfd, &buf, 1, 0);
+  res = recv(tfmfd, &buf, 1, 0);
+  printf("recv: %d  %s\n", res, buf);
 
   total_recv += res;
   if (res < 0) {
@@ -394,7 +336,7 @@ int main_tls_client() {
 
   filefd = open(test_data, O_RDONLY);
 
-  res = sendfile(opfd, filefd, &offset, totalbytes);
+  res = sendfile(tfmfd, filefd, &offset, totalbytes);
 
   close(filefd);
 
@@ -487,7 +429,7 @@ void Servlet(int client, SSL* ssl)/* Serve the connection -- threadable */
       bytes = SSL_read(ssl, buf, sizeof(buf));/* get request */
       if ( bytes > 0 )
         {
-
+          printf("Bytes content: %i   -->%s\n", bytes_recv, buf);
         } else if (bytes == 0) {
         printf("Bytes recv: %i\n", bytes_recv);
       }
